@@ -12,6 +12,9 @@ enum class SensitiveType(val title: String) {
     PHONE("Phone numbers"),
     AADHAAR("Aadhaar numbers"),
     PAN("PAN numbers"),
+    ENROLLMENT("Enrollment / student ID numbers"),
+    STUDENT_NAME("Student names (labelled fields)"),
+    PINCODE("Postal PIN codes"),
     CUSTOM("Custom text / names")
 }
 
@@ -62,6 +65,15 @@ object PrivacyScanner {
         SensitiveType.PAN to Regex("(?i)\\b[A-Z]{5}\\d{4}[A-Z]\\b")
     )
 
+    // Label-driven rules avoid treating arbitrary 6- or 10-digit numbers as private IDs.
+    private val enrollmentLabel = Regex(
+        "(?i)(?:enrollment|enrolment)(?:\\s*(?:no\\.?|number|#))?|अनुक्रमांक|नामांकन\\s*संख्या"
+    )
+    private val studentNameLabel = Regex(
+        "(?i)(?:name\\s+of\\s+(?:the\\s+)?student|student(?:'s)?\\s+name|परीक्षार्थी\\s*का\\s*नाम|छात्र\\s*का\\s*नाम)"
+    )
+    private val pincodeLabel = Regex("(?i)(?:pin\\s*code|pincode|postal\\s*code|पिनकोड)")
+
     fun scanPage(
         pageIndex: Int,
         bitmapWidth: Int,
@@ -88,6 +100,7 @@ object PrivacyScanner {
             val normalizedLineText = normalizeDigits(lineText.toString())
             val aadhaarMatches = patterns.getValue(SensitiveType.AADHAAR)
                 .findAll(normalizedLineText).toList()
+            val enrollmentLabelMatch = enrollmentLabel.find(normalizedLineText)
             patterns.forEach { (type, regex) ->
                 regex.findAll(normalizedLineText).forEach matchLoop@ { match ->
                     // A 12-digit Aadhaar string can otherwise look like a 10-digit
@@ -95,12 +108,45 @@ object PrivacyScanner {
                     if (type == SensitiveType.PHONE && aadhaarMatches.any { aadhaar ->
                             match.range.first <= aadhaar.range.last && match.range.last >= aadhaar.range.first
                         }) return@matchLoop
-                    val matched = spans.filter { it.start < match.range.last + 1 && it.endExclusive > match.range.first }
-                    if (matched.isNotEmpty()) {
-                        findings += toFinding(
-                            pageIndex, type, match.value, matched.map { it.word.bounds }, bitmapWidth, bitmapHeight
-                        )
+                    // Do not classify a labelled enrollment ID as a phone number.
+                    if (type == SensitiveType.PHONE && enrollmentLabelMatch != null &&
+                        match.range.first > enrollmentLabelMatch.range.last) return@matchLoop
+                    addFindingForRange(findings, pageIndex, type, match.value, match.range.first,
+                        match.range.last + 1, spans, bitmapWidth, bitmapHeight)
+                }
+            }
+
+            // Enrollment IDs are detected only when OCR also sees an enrollment label.
+            enrollmentLabelMatch?.let { label ->
+                val valueStart = skipFieldSeparators(normalizedLineText, label.range.last + 1)
+                val valueMatch = Regex("[0-9][0-9\\s-]{7,18}[0-9]")
+                    .find(normalizedLineText, valueStart)
+                if (valueMatch != null) {
+                    val digits = valueMatch.value.filter(Char::isDigit)
+                    if (digits.length in 9..16) {
+                        addFindingForRange(findings, pageIndex, SensitiveType.ENROLLMENT, valueMatch.value,
+                            valueMatch.range.first, valueMatch.range.last + 1, spans, bitmapWidth, bitmapHeight)
                     }
+                }
+            }
+
+            // Only redact a name when it follows an explicit student-name label.
+            studentNameLabel.find(normalizedLineText)?.let { label ->
+                val valueStart = skipFieldSeparators(normalizedLineText, label.range.last + 1)
+                val nameMatch = Regex("[\\p{L}][\\p{L}.'-]*(?:\\s+[\\p{L}][\\p{L}.'-]*){0,3}")
+                    .find(normalizedLineText, valueStart)
+                if (nameMatch != null) {
+                    addFindingForRange(findings, pageIndex, SensitiveType.STUDENT_NAME, nameMatch.value,
+                        nameMatch.range.first, nameMatch.range.last + 1, spans, bitmapWidth, bitmapHeight)
+                }
+            }
+
+            pincodeLabel.find(normalizedLineText)?.let { label ->
+                val valueStart = skipFieldSeparators(normalizedLineText, label.range.last + 1)
+                val pinMatch = Regex("[0-9]{6}").find(normalizedLineText, valueStart)
+                if (pinMatch != null) {
+                    addFindingForRange(findings, pageIndex, SensitiveType.PINCODE, pinMatch.value,
+                        pinMatch.range.first, pinMatch.range.last + 1, spans, bitmapWidth, bitmapHeight)
                 }
             }
 
@@ -121,6 +167,22 @@ object PrivacyScanner {
         return findings.distinctBy {
             Triple(it.type, it.value.lowercase(), listOf(it.normalizedBounds.left, it.normalizedBounds.top))
         }
+    }
+
+    private fun addFindingForRange(
+        findings: MutableList<PrivacyFinding>, pageIndex: Int, type: SensitiveType, value: String,
+        start: Int, endExclusive: Int, spans: List<WordSpan>, bitmapWidth: Int, bitmapHeight: Int
+    ) {
+        val matched = spans.filter { it.start < endExclusive && it.endExclusive > start }
+        if (matched.isNotEmpty()) {
+            findings += toFinding(pageIndex, type, value, matched.map { it.word.bounds }, bitmapWidth, bitmapHeight)
+        }
+    }
+
+    private fun skipFieldSeparators(text: String, start: Int): Int {
+        var index = start.coerceIn(0, text.length)
+        while (index < text.length && (text[index].isWhitespace() || text[index] in ":：|/#.-–—")) index++
+        return index
     }
 
     private fun groupIntoLines(words: List<OcrWord>): List<List<OcrWord>> {

@@ -691,6 +691,9 @@ private fun previewValue(value: String, type: SensitiveType): String = when (typ
     SensitiveType.PHONE -> "••••••" + value.takeLast(4)
     SensitiveType.AADHAAR -> "•••• •••• " + value.filter(Char::isDigit).takeLast(4)
     SensitiveType.PAN -> "••••••" + value.takeLast(4)
+    SensitiveType.ENROLLMENT -> "••••••" + value.filter(Char::isDigit).takeLast(4)
+    SensitiveType.STUDENT_NAME -> value.firstOrNull()?.let { "$it•••" } ?: "•••"
+    SensitiveType.PINCODE -> "••••" + value.takeLast(2)
     SensitiveType.CUSTOM -> value
 }
 
